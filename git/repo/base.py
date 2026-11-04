@@ -85,8 +85,11 @@ from typing import (
 from git.types import ConfigLevels_Tup, TypedDict
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from git.objects import Tree
     from git.objects.submodule.base import UpdateProgress
+    from git.objects.submodule.handoff import HandoffScope, SubmoduleHandoff
     from git.refs.symbolic import SymbolicReference
     from git.remote import RemoteProgress
     from git.util import IterableList
@@ -625,15 +628,67 @@ class Repo:
         """
         return RootModule(self).traverse(*args, **kwargs)
 
+    @property
+    def submodule_handoff(self) -> "SubmoduleHandoff":
+        """The submodule handoff-generation registry of this repository.
+
+        The registry separates the submodule configuration ledger
+        (``.gitmodules`` and ``.git/config``), the module checkout ledger and
+        the parent gitlink ledger into nested, recoverable generations. See
+        :mod:`git.objects.submodule.handoff`.
+        """
+        from git.objects.submodule.handoff import SubmoduleHandoff, submodule_handoff
+
+        handoff = submodule_handoff(self)
+        assert isinstance(handoff, SubmoduleHandoff)
+        return handoff
+
+    def submodule_generation(self, declare: Optional[int] = None) -> "AbstractContextManager[HandoffScope]":
+        """Open a submodule handoff generation on this repository.
+
+        :param declare:
+            Optional explicit generation number; must be strictly greater
+            than the registry's current frontier. Defaults to advancing the
+            frontier by one.
+
+        Use as a context manager::
+
+            with repo.submodule_generation():
+                repo.create_submodule(...)
+
+        On exception, side effects recorded on the generation's ledgers are
+        rolled back; configuration or gitlink intents of a superseded
+        generation are rejected before they land.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _generation() -> Iterator[HandoffScope]:
+            with self.submodule_handoff.generation(declare=declare) as scope:
+                yield scope
+
+        return _generation()
+
     def submodule_update(self, *args: Any, **kwargs: Any) -> RootModule:
         """Update the submodules, keeping the repository consistent as it will
         take the previous state into consideration.
+
+        The differential phase (remove/path/branch/url changes between
+        commits) is fenced through this repository's
+        :attr:`submodule_handoff` ROOT_DIFF ledger; wrap the call in
+        :meth:`submodule_generation` to bind it to a generation. The trailing
+        per-submodule checkouts remain on the separate MODULE ledger of
+        :meth:`Submodule.update <git.objects.submodule.base.Submodule.update>`.
 
         :note:
             For more information, please see the documentation of
             :meth:`RootModule.update <git.objects.submodule.root.RootModule.update>`.
         """
-        return RootModule(self).update(*args, **kwargs)
+        # Bind the RootModule mount point explicitly; its handoff registry is
+        # the same object returned by ``self.submodule_handoff``.
+        root = RootModule(self)
+        assert root.handoff is self.submodule_handoff
+        return root.update(*args, **kwargs)
 
     # }END submodules
 

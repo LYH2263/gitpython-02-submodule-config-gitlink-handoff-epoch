@@ -3,10 +3,11 @@
 
 __all__ = ["RootModule", "RootUpdateProgress"]
 
+import contextlib
 import logging
 
 # typing -------------------------------------------------------------------
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 import git
 from git.exc import InvalidGitRepositoryError
@@ -14,10 +15,12 @@ from git.types import Commit_ish
 from git.util import IterableList
 
 from .base import Submodule, UpdateProgress
+from .handoff import HandoffLedger, SubmoduleHandoff, submodule_handoff
 from .util import find_first_remote_branch
 
 if TYPE_CHECKING:
     from git.repo import Repo
+    from .handoff import HandoffScope
 
 # ----------------------------------------------------------------------------
 
@@ -51,7 +54,7 @@ class RootModule(Submodule):
     superproject (master repository).
     """
 
-    __slots__ = ()
+    __slots__ = ("_handoff",)
 
     k_root_name = "__ROOT__"
 
@@ -67,6 +70,22 @@ class RootModule(Submodule):
             url="",
             branch_path=git.Head.to_full_path(self.k_head_default),
         )
+        # Bind the generation registry to the RootModule mount point, so
+        # Repo.submodule_update() is fenced through this instance's ledger.
+        self._handoff: SubmoduleHandoff = submodule_handoff(repo)
+
+    @property
+    def handoff(self) -> SubmoduleHandoff:
+        """The submodule handoff-generation registry of this superproject."""
+        return self._handoff
+
+    @contextlib.contextmanager
+    def generation(
+        self, declare: "Optional[int]" = None
+    ) -> "Iterator[HandoffScope]":
+        """Open a handoff generation covering a root differential update."""
+        with self._handoff.generation(declare=declare) as scope:
+            yield scope
 
     def _clear_cache(self) -> None:
         """May not do anything."""
@@ -168,6 +187,13 @@ class RootModule(Submodule):
         repo = self.repo
         sms: "IterableList[Submodule]" = IterableList("name")
 
+        # The root differential phase has its own ledger: removing moved-away
+        # modules and applying path/url/branch changes between two parent
+        # commits is a different command semantic from the per-submodule
+        # Submodule.update checkout (pinned binsha or tracking tip). The
+        # trailing per-submodule updates claim their own MODULE intents.
+        diff_intent = self._handoff.claim(HandoffLedger.ROOT_DIFF)
+
         try:
             # SETUP BASE COMMIT
             ###################
@@ -191,6 +217,10 @@ class RootModule(Submodule):
             spsms = set(psms)
             ssms = set(sms)
 
+            # ROOT_DIFF entry checkpoint: observable independently of the
+            # MODULE checkpoints the per-submodule update loop records later.
+            diff_intent.check("differential")
+
             # HANDLE REMOVALS
             ###################
             rrsm = spsms - ssms
@@ -210,6 +240,9 @@ class RootModule(Submodule):
                     len_rrsm,
                     prefix + "Removing submodule %r at %s" % (rsm.name, rsm.abspath),
                 )
+                # ROOT_DIFF checkpoint for the removal decision; the actual
+                # checkout deletion lands on the MODULE ledger inside remove().
+                diff_intent.check("remove", rsm.name)
                 rsm._parent_commit = repo.head.commit
                 rsm.remove(
                     configuration=False,
@@ -244,6 +277,9 @@ class RootModule(Submodule):
                     )
                     # Move the module to the new path.
                     if not dry_run:
+                        # ROOT_DIFF checkpoint for the path change; the
+                        # physical checkout move itself lands on MODULE.
+                        diff_intent.check("path", csm.name)
                         psm.move(sm.path, module=True, configuration=False)
                     # END handle dry_run
                     progress.update(
@@ -276,6 +312,11 @@ class RootModule(Submodule):
                             )
 
                             if not dry_run:
+                                # ROOT_DIFF checkpoint for the url change. The
+                                # remote swap happens in the module repository;
+                                # it is not a Submodule.update tip checkout and
+                                # must never share its gate.
+                                diff_intent.check("url", csm.name)
                                 previous_remote = None
                                 for remote in rmts:
                                     if remote.url == psm.url:
@@ -386,6 +427,8 @@ class RootModule(Submodule):
                             % (sm.name, psm.branch_path, sm.branch_path),
                         )
                         if not dry_run:
+                            # ROOT_DIFF checkpoint for the branch change.
+                            diff_intent.check("branch", csm.name)
                             smm = sm.module()
                             smmr = smm.remotes
                             # As the branch might not exist yet, fetch all remotes

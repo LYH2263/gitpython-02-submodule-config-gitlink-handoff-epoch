@@ -3,6 +3,7 @@
 
 __all__ = ["Submodule", "UpdateProgress"]
 
+import contextlib
 import gc
 import logging
 import ntpath
@@ -61,6 +62,15 @@ from .util import (
     mkhead,
     sm_name,
     sm_section,
+)
+
+from .handoff import (
+    HandoffIntent,
+    HandoffLedger,
+    HandoffScope,
+    SubmoduleHandoff,
+    submodule_generation,
+    submodule_handoff,
 )
 
 from git.types import TBD, Commit_ish, PathLike
@@ -228,6 +238,84 @@ class Submodule(IndexObject, TraversableIterableObj):
             self.url,
             self.branch_path,
         )
+
+    # { Handoff generations
+
+    @property
+    def handoff(self) -> SubmoduleHandoff:
+        """The submodule handoff-generation registry of our parent repository.
+
+        See :mod:`git.objects.submodule.handoff` for the generation protocol
+        that separates configuration, module-checkout and gitlink ledgers.
+        """
+        return submodule_handoff(self.repo)
+
+    @classmethod
+    @contextlib.contextmanager
+    def handoff_generation(cls, repo: "Repo", declare: Union[int, None] = None) -> Iterator["HandoffScope"]:
+        """Open a submodule handoff generation on *repo*.
+
+        Within the context, all configuration writes (``.gitmodules`` and
+        ``.git/config``), module checkouts and parent gitlink rewrites are
+        fenced by the generation. Nested calls open nested generations; see
+        :class:`~git.objects.submodule.handoff.SubmoduleHandoff`.
+        """
+        with submodule_generation(repo, declare) as scope:
+            yield scope
+
+    def _handoff_claims(
+        self,
+    ) -> "tuple[SubmoduleHandoff, HandoffIntent, HandoffIntent, HandoffIntent]":
+        """Claim module, configuration and gitlink intents for one operation."""
+        handoff = submodule_handoff(self.repo)
+        return (
+            handoff,
+            handoff.claim(HandoffLedger.MODULE, name=self.name),
+            handoff.claim(HandoffLedger.CONFIGURATION, name=self.name),
+            handoff.claim(HandoffLedger.GITLINK, name=self.name),
+        )
+
+    def _handoff_remember_git_config(self, intent: HandoffIntent, section: str, option: str) -> None:
+        """Snapshot one ``.git/config`` option so it can be restored on rollback."""
+        if not intent.enabled:
+            return
+        try:
+            with self.repo.config_reader() as reader:
+                section_existed = reader.has_section(section)
+                had = section_existed and reader.has_option(section, option)
+                previous = reader.get_value(section, option) if had else None
+        except cp.Error:
+            return
+
+        def undo() -> None:
+            with self.repo.config_writer() as writer:
+                if not section_existed:
+                    if writer.has_section(section):
+                        writer.remove_section(section)
+                elif had:
+                    writer.set_value(section, option, previous)
+                elif writer.has_section(section):
+                    writer.remove_option(section, option)
+
+        intent.defer_undo(undo)
+
+    def _handoff_remember_head(self, intent: HandoffIntent, mrepo: "Repo") -> None:
+        """Snapshot a module's checked-out commit so a rollback checks it back."""
+        if not intent.enabled:
+            return
+        was_detached = mrepo.head.is_detached
+        old_hexsha = mrepo.head.commit.hexsha
+
+        def undo() -> None:
+            if was_detached:
+                mrepo.git.checkout(old_hexsha, force=True)
+            else:
+                mrepo.head.reset(old_hexsha, index=True, working_tree=True)
+            # END restore the previous checkout state
+
+        intent.defer_undo(undo)
+
+    # } END handoff generations
 
     @classmethod
     def _config_parser(
@@ -707,6 +795,13 @@ class Submodule(IndexObject, TraversableIterableObj):
 
         mrepo: Union[Repo, None] = None
 
+        # Claim one intent per ledger: module checkout, parent configuration
+        # and the parent gitlink are fenced independently.
+        handoff = submodule_handoff(repo)
+        module_intent = handoff.claim(HandoffLedger.MODULE, name=name)
+        config_intent = handoff.claim(HandoffLedger.CONFIGURATION, name=name)
+        gitlink_intent = handoff.claim(HandoffLedger.GITLINK, name=name)
+
         if url is None:
             if not has_module:
                 raise ValueError("A URL was not given and a repository did not exist at %s" % path)
@@ -733,6 +828,16 @@ class Submodule(IndexObject, TraversableIterableObj):
             if clone_multi_options:
                 kwargs["multi_options"] = clone_multi_options
 
+            # Module ledger checkpoint: a newer generation must prevent the
+            # clone from landing in the old generation's checkout location.
+            module_intent.check("clone", name)
+            module_intent.remember_creation(
+                cls._checked_abspath(
+                    repo.working_tree_dir, path, git_dirs=(repo.git_dir, repo.common_dir)
+                )
+            )
+            module_intent.remember_creation(cls._module_abspath(repo, path, name))
+
             # _clone_repo(cls, repo, url, path, name, **kwargs):
             mrepo = cls._clone_repo(
                 repo,
@@ -755,10 +860,14 @@ class Submodule(IndexObject, TraversableIterableObj):
         # -a38efa84daef914e4de58d1905a500d8d14aaf45 submodules/intermediate/one
         writer: Union[GitConfigParser, SectionConstraint]
 
+        # Configuration ledger checkpoint for the .git/config url.
+        config_intent.check("git-config-url", name)
+        sm._handoff_remember_git_config(config_intent, sm_section(name), "url")
         with sm.repo.config_writer() as writer:
             writer.set_value(sm_section(name), "url", url)
 
-        # Update configuration and index.
+        # Update configuration and index. The .gitmodules writer claims its
+        # own configuration intent when it is handed out.
         index = sm.repo.index
         with sm.config_writer(index=index, write=False) as writer:
             writer.set_value("url", url)
@@ -775,6 +884,10 @@ class Submodule(IndexObject, TraversableIterableObj):
             # Release cat-file processes before callers move the checkout on Windows.
             with mrepo:
                 sm.binsha = mrepo.head.commit.binsha
+        # Gitlink ledger checkpoint: the parent index gitlink is a separate
+        # ledger from the .gitmodules configuration above.
+        gitlink_intent.check("gitlink-add", name)
+        gitlink_intent.remember_index_entry(index, index.entry_key(os.fspath(path), 0))
         index.add([sm], write=True)
 
         return sm
@@ -881,6 +994,14 @@ class Submodule(IndexObject, TraversableIterableObj):
             prefix = "DRY-RUN: "
         # END handle prefix
 
+        # The single-module update is a module-ledger command (clone/fetch/
+        # checkout to our binsha, or tip following). It is fenced separately
+        # from the RootModule differential command semantic; its .git/config
+        # url writes land on the configuration ledger.
+        handoff = submodule_handoff(self.repo)
+        module_intent = handoff.claim(HandoffLedger.MODULE, name=self.name)
+        config_intent = handoff.claim(HandoffLedger.CONFIGURATION, name=self.name)
+
         mrepo = None
         # END init mrepo
 
@@ -950,12 +1071,19 @@ class Submodule(IndexObject, TraversableIterableObj):
                             raise OSError(
                                 "Module directory at %r does already exist and is non-empty" % checkout_module_abspath
                             )
+                        # Reconnecting a deinitialized checkout lands on the
+                        # module ledger; the retained .git/modules metadata is
+                        # not ours to remove.
+                        module_intent.check("reconnect", self.name)
+                        module_intent.remember_creation(checkout_module_abspath)
                         os.makedirs(checkout_module_abspath, exist_ok=True)
                         self._write_git_file_and_module_config(checkout_module_abspath, module_abspath)
                         mrepo = git.Repo(checkout_module_abspath)
                         mrepo.head.reset(mrepo.head.commit, index=True, working_tree=True)
                         if not no_fetch:
                             fetch_remotes(mrepo)
+                        config_intent.check("git-config-url", self.name)
+                        self._handoff_remember_git_config(config_intent, sm_section(self.name), "url")
                         with self.repo.config_writer() as writer:
                             writer.set_value(sm_section(self.name), "url", self.url)
 
@@ -972,6 +1100,14 @@ class Submodule(IndexObject, TraversableIterableObj):
 
                     # Don't check it out at first - nonetheless it will create a local
                     # branch according to the remote-HEAD if possible.
+
+                    # Module ledger checkpoint for the clone: an intent claimed
+                    # at update entry must still be current before the clone lands.
+                    if not dry_run:
+                        module_intent.check("clone", self.name)
+                        module_intent.remember_creation(checkout_module_abspath)
+                        module_intent.remember_creation(module_abspath)
+
                     progress.update(
                         BEGIN | CLONE,
                         0,
@@ -1014,6 +1150,8 @@ class Submodule(IndexObject, TraversableIterableObj):
                         except (IndexError, InvalidGitRepositoryError):
                             _logger.warning("Failed to checkout tracking branch %s", self.branch_path)
 
+                        config_intent.check("git-config-url", self.name)
+                        self._handoff_remember_git_config(config_intent, sm_section(self.name), "url")
                         with self.repo.config_writer() as writer:
                             writer.set_value(sm_section(self.name), "url", self.url)
             # END handle initialization
@@ -1093,6 +1231,13 @@ class Submodule(IndexObject, TraversableIterableObj):
                 )
 
                 if not dry_run and may_reset:
+                    # Module ledger checkout checkpoint. Following the tracking
+                    # branch tip ("tip") is fenced separately from checking out
+                    # the binsha pinned by the parent commit ("checkout"); the
+                    # RootModule differential phase has its own ledger and can
+                    # never be gated through this switch.
+                    module_intent.check("tip" if to_latest_revision else "checkout", self.name)
+                    self._handoff_remember_head(module_intent, mrepo)
                     if is_detached:
                         # NOTE: For now we force. The user is not supposed to change
                         # detached submodules anyway. Maybe at some point this becomes
@@ -1174,6 +1319,13 @@ class Submodule(IndexObject, TraversableIterableObj):
             raise ValueError("You must specify to move at least the module or the configuration of the submodule")
         # END handle input
 
+        # The physical checkout move and the configuration/gitlink rewrite are
+        # independent ledgers; the configuration/module switches keep their
+        # separate semantics inside the same generation.
+        handoff = submodule_handoff(self.repo)
+        module_intent = handoff.claim(HandoffLedger.MODULE, name=self.name)
+        gitlink_intent = handoff.claim(HandoffLedger.GITLINK, name=self.name)
+
         self._validated_name(self.name)
         module_checkout_path = self._to_relative_path(self.repo, module_path)
 
@@ -1225,12 +1377,22 @@ class Submodule(IndexObject, TraversableIterableObj):
         # Move the module into place if possible.
         renamed_module = False
         if module and osp.exists(cur_path):
+            module_intent.check("module-move", self.name)
             self._renames(cur_path, module_checkout_abspath)
             renamed_module = True
 
             if osp.isfile(osp.join(module_checkout_abspath, ".git")):
                 self._write_git_file_and_module_config(module_checkout_abspath, module_abspath)
             # END handle git file rewrite
+
+            def undo_module_move() -> None:
+                # Idempotent: only move back when the rename is still in place.
+                if osp.isdir(module_checkout_abspath) and not osp.exists(cur_path):
+                    self._renames(module_checkout_abspath, cur_path)
+                    if osp.isfile(osp.join(cur_path, ".git")):
+                        self._write_git_file_and_module_config(cur_path, module_abspath)
+
+            module_intent.defer_undo(undo_module_move)
         # END move physical module
 
         # Rename the index entry - we have to manipulate the index directly as git-mv
@@ -1238,8 +1400,11 @@ class Submodule(IndexObject, TraversableIterableObj):
         previous_sm_path = self.path
         try:
             if configuration:
+                gitlink_intent.check("gitlink-move", self.name)
                 try:
                     ekey = index.entry_key(self.path, 0)
+                    gitlink_intent.remember_index_entry(index, ekey)
+                    gitlink_intent.remember_index_entry(index, tekey)
                     entry = index.entries[ekey]
                     del index.entries[ekey]
                     nentry = git.IndexEntry(entry[:3] + (module_checkout_path,) + entry[4:])
@@ -1328,6 +1493,13 @@ class Submodule(IndexObject, TraversableIterableObj):
             raise ValueError("Need to specify to delete at least the module, or the configuration")
         # END handle parameters
 
+        # Module deletion and configuration/gitlink deletion stay on their own
+        # ledgers, mirroring the module/configuration switches of this method.
+        handoff = submodule_handoff(self.repo)
+        module_intent = handoff.claim(HandoffLedger.MODULE, name=self.name)
+        config_intent = handoff.claim(HandoffLedger.CONFIGURATION, name=self.name)
+        gitlink_intent = handoff.claim(HandoffLedger.GITLINK, name=self.name)
+
         self._validated_name(self.name)
         if configuration:
             self._checked_abspath(self.repo.working_tree_dir, self.k_modules_file)
@@ -1348,6 +1520,10 @@ class Submodule(IndexObject, TraversableIterableObj):
         # DELETE REPOSITORY WORKING TREE
         ################################
         if module and self.module_exists():
+            # Module ledger checkpoint: a superseded generation must not delete
+            # the checkout into the newer generation's working tree. Forced tree
+            # deletion has no inverse, so no rollback action is registered.
+            module_intent.check("module-remove", self.name)
             mod = self.module()
             git_dir = str(Path(mod.git_dir).resolve())
             if force:
@@ -1431,8 +1607,13 @@ class Submodule(IndexObject, TraversableIterableObj):
         if configuration and not dry_run:
             # First the index-entry.
             parent_index = self.repo.index
+            # Gitlink ledger checkpoint, taken before the parent index entry
+            # for the submodule is dropped.
+            gitlink_intent.check("gitlink-remove", self.name)
+            ekey = parent_index.entry_key(self.path, 0)
+            gitlink_intent.remember_index_entry(parent_index, ekey)
             try:
-                del parent_index.entries[parent_index.entry_key(self.path, 0)]
+                del parent_index.entries[ekey]
             except KeyError:
                 pass
             # END delete entry
@@ -1441,9 +1622,13 @@ class Submodule(IndexObject, TraversableIterableObj):
             # Now git config - we need the config intact, otherwise we can't query
             # information anymore.
 
+            # Configuration ledger checkpoint for the .git/config section.
+            config_intent.check("git-config-remove", self.name)
             with self.repo.config_writer() as gcp_writer:
                 gcp_writer.remove_section(sm_section(self.name))
 
+            # The .gitmodules writer carries its own generation intent and
+            # restores the file plus its index blob on generation rollback.
             with self.config_writer() as sc_writer:
                 sc_writer.remove_section()
         # END delete configuration
@@ -1473,10 +1658,26 @@ class Submodule(IndexObject, TraversableIterableObj):
         :note:
             Doesn't work in bare repositories.
         """
+        # deinit lands on the module ledger only: it unregisters the checkout
+        # while retaining .gitmodules and .git/modules, unlike
+        # remove(configuration=True). Its generation is therefore independent
+        # of the configuration and gitlink ledgers.
+        module_intent = submodule_handoff(self.repo).claim(HandoffLedger.MODULE, name=self.name)
+        module_intent.check("deinit", self.name)
+        path_arg = str(self.path)
+
+        def undo_deinit() -> None:
+            try:
+                self.repo.git.submodule("update", "--init", "--", path_arg)
+            except Exception as ex:  # noqa: BLE001 - rollback is best effort
+                _logger.error("Failed to re-initialize submodule %r on rollback: %s", path_arg, ex)
+
+        module_intent.defer_undo(undo_deinit)
+
         args: List[str] = []
         if force:
             args.append("--force")
-        args.extend(["--", str(self.path)])
+        args.extend(["--", path_arg])
         self.repo.git.submodule("deinit", *args)
         return self
 
@@ -1563,6 +1764,7 @@ class Submodule(IndexObject, TraversableIterableObj):
             If the ``.gitmodules`` file/blob could not be read.
         """
         writer = self._config_parser_constrained(read_only=False)
+        writer.config.bind_handoff(self)
         if index is not None:
             writer.config._index = index
         writer.config._auto_write = write
@@ -1590,6 +1792,10 @@ class Submodule(IndexObject, TraversableIterableObj):
 
         self._validated_name(self.name)
         self._validated_name(new_name)
+        old_name = self.name
+        handoff = submodule_handoff(self.repo)
+        config_intent = handoff.claim(HandoffLedger.CONFIGURATION, name=old_name)
+        module_intent = handoff.claim(HandoffLedger.MODULE, name=old_name)
         mod = self.module()
         destination_module_abspath = self._module_abspath(self.repo, self.path, new_name, moving_from=mod.git_dir)
         self._checked_abspath(self.repo.working_tree_dir, self.k_modules_file)
@@ -1599,8 +1805,18 @@ class Submodule(IndexObject, TraversableIterableObj):
             # As we ourselves didn't write anything about submodules into the parent
             # .git/config, we will not require it to exist, and just ignore missing
             # entries.
-            if pw.has_section(sm_section(self.name)):
-                pw.rename_section(sm_section(self.name), sm_section(new_name))
+            if pw.has_section(sm_section(old_name)):
+                config_intent.check("git-config-rename", old_name)
+
+                def undo_parent_section_rename() -> None:
+                    with self.repo.config_writer() as undo_writer:
+                        if undo_writer.has_section(sm_section(new_name)) and not undo_writer.has_section(
+                            sm_section(old_name)
+                        ):
+                            undo_writer.rename_section(sm_section(new_name), sm_section(old_name))
+
+                config_intent.defer_undo(undo_parent_section_rename)
+                pw.rename_section(sm_section(old_name), sm_section(new_name))
 
         # .gitmodules
         with self.config_writer(write=True).config as cw:
@@ -1610,16 +1826,30 @@ class Submodule(IndexObject, TraversableIterableObj):
 
         # .git/modules
         if mod.has_separate_working_tree():
+            module_intent.check("modules-rename", old_name)
+            original_git_dir = mod.git_dir
+            moves: "list[tuple[Any, Any]]" = []
             source_dir = mod.git_dir
             # Let's be sure the submodule name is not so obviously tied to a directory.
             if str(destination_module_abspath).startswith(str(mod.git_dir)):
                 tmp_dir = self._module_abspath(self.repo, self.path, str(uuid.uuid4()))
                 self._renames(source_dir, tmp_dir)
+                moves.append((source_dir, tmp_dir))
                 source_dir = tmp_dir
             # END handle self-containment
             self._renames(source_dir, destination_module_abspath)
+            moves.append((source_dir, destination_module_abspath))
             if mod.working_tree_dir:
                 self._write_git_file_and_module_config(mod.working_tree_dir, destination_module_abspath)
+
+            def undo_modules_rename() -> None:
+                for src, dst in reversed(moves):
+                    if osp.isdir(dst) and not osp.exists(src):
+                        self._renames(dst, src)
+                if mod.working_tree_dir and osp.isfile(osp.join(mod.working_tree_dir, ".git")):
+                    self._write_git_file_and_module_config(mod.working_tree_dir, original_git_dir)
+
+            module_intent.defer_undo(undo_modules_rename)
         # END move separate git repository
 
         return self
